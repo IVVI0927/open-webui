@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import copy
+import asyncio
 import logging
-from typing import Optional
+import time
 
 import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request
 from mcp.shared.auth import OAuthMetadata
-from open_webui.config import BannerModel, async_save_config, get_config, save_config
+from open_webui.config import BannerModel, async_save_config, get_config
 from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, AIOHTTP_CLIENT_TIMEOUT
-from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import get_custom_headers
 from open_webui.utils.mcp.client import MCPClient
 from open_webui.utils.oauth import (
     OAuthClientInformationFull,
-    decrypt_data,
     encrypt_data,
     get_discovery_urls,
     get_oauth_client_info_with_dynamic_client_registration,
@@ -139,7 +137,7 @@ async def register_oauth_client(
         log.debug(f'Failed to register OAuth client: {e}')
         raise HTTPException(
             status_code=400,
-            detail=f'Failed to register OAuth client',
+            detail='Failed to register OAuth client',
         )
 
 
@@ -427,7 +425,7 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
 
                                 if oauth_token:
                                     token = oauth_token.get('access_token', '')
-                        except Exception as e:
+                        except Exception:
                             pass
                     if token:
                         headers = {'Authorization': f'Bearer {token}'}
@@ -448,7 +446,7 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
                     log.debug(f'Failed to create MCP client: {e}')
                     raise HTTPException(
                         status_code=400,
-                        detail=f'Failed to create MCP client',
+                        detail='Failed to create MCP client',
                     )
                 finally:
                     if client:
@@ -471,7 +469,7 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
                         if oauth_token:
                             token = oauth_token.get('access_token', '')
 
-                except Exception as e:
+                except Exception:
                     pass
 
             if token:
@@ -491,8 +489,191 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
         log.debug(f'Failed to connect to the tool server: {e}')
         raise HTTPException(
             status_code=400,
-            detail=f'Failed to connect to the tool server',
+            detail='Failed to connect to the tool server',
         )
+
+
+############################
+# ToolServerStatus
+############################
+
+_HEALTH_CHECK_TIMEOUT = 5  # seconds
+
+
+class ToolServerStatusItem(BaseModel):
+    id: str
+    name: str | None = None
+    url: str
+    type: str
+    status: str  # 'ok' | 'error' | 'skipped'
+    latency_ms: float | None = None
+    tools_count: int | None = None
+    error: str | None = None
+
+
+class ToolServersStatusResponse(BaseModel):
+    servers: list[ToolServerStatusItem]
+
+
+async def _check_mcp_server(connection: dict, idx: int) -> ToolServerStatusItem:
+    """Probe a single MCP server and return its health status."""
+    info = connection.get('info') or {}
+    server_id = info.get('id') or str(idx)
+    name = info.get('name')
+    url = connection.get('url', '')
+    auth_type = connection.get('auth_type', 'none')
+
+    # OAuth servers cannot be probed without a live user session — report as skipped.
+    if auth_type in ('oauth_2.1', 'oauth_2.1_static'):
+        return ToolServerStatusItem(
+            id=server_id,
+            name=name,
+            url=url,
+            type='mcp',
+            status='skipped',
+            error='OAuth servers cannot be probed without an active user session.',
+        )
+
+    token = None
+    if auth_type == 'bearer':
+        token = connection.get('key')
+    headers = {'Authorization': f'Bearer {token}'} if token else None
+
+    client = MCPClient()
+    t0 = time.monotonic()
+    try:
+        await asyncio.wait_for(client.connect(url, headers=headers), timeout=_HEALTH_CHECK_TIMEOUT)
+        specs = await asyncio.wait_for(client.list_tool_specs(), timeout=_HEALTH_CHECK_TIMEOUT)
+        latency_ms = round((time.monotonic() - t0) * 1000, 1)
+        return ToolServerStatusItem(
+            id=server_id,
+            name=name,
+            url=url,
+            type='mcp',
+            status='ok',
+            latency_ms=latency_ms,
+            tools_count=len(specs) if specs else 0,
+        )
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - t0) * 1000, 1)
+        return ToolServerStatusItem(
+            id=server_id,
+            name=name,
+            url=url,
+            type='mcp',
+            status='error',
+            latency_ms=latency_ms,
+            error=str(exc),
+        )
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _check_openapi_server(connection: dict, idx: int) -> ToolServerStatusItem:
+    """Probe a single OpenAPI tool server and return its health status."""
+    info = connection.get('info') or {}
+    server_id = info.get('id') or str(idx)
+    name = info.get('name')
+    url = connection.get('url', '')
+    auth_type = connection.get('auth_type', 'bearer')
+    token = None
+    if auth_type == 'bearer':
+        token = connection.get('key')
+    headers = {'Authorization': f'Bearer {token}'} if token else None
+
+    spec_url = get_tool_server_url(url, connection.get('path', 'openapi.json'))
+    t0 = time.monotonic()
+    try:
+        async with aiohttp.ClientSession(
+            trust_env=True,
+            timeout=aiohttp.ClientTimeout(total=_HEALTH_CHECK_TIMEOUT),
+        ) as session:
+            async with session.get(spec_url, headers=headers, ssl=AIOHTTP_CLIENT_SESSION_SSL) as resp:
+                latency_ms = round((time.monotonic() - t0) * 1000, 1)
+                if resp.status != 200:
+                    return ToolServerStatusItem(
+                        id=server_id,
+                        name=name,
+                        url=url,
+                        type='openapi',
+                        status='error',
+                        latency_ms=latency_ms,
+                        error=f'HTTP {resp.status}',
+                    )
+                data = await resp.json(content_type=None)
+                tools_count = len(data.get('paths', {}))
+                return ToolServerStatusItem(
+                    id=server_id,
+                    name=name,
+                    url=url,
+                    type='openapi',
+                    status='ok',
+                    latency_ms=latency_ms,
+                    tools_count=tools_count,
+                )
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - t0) * 1000, 1)
+        return ToolServerStatusItem(
+            id=server_id,
+            name=name,
+            url=url,
+            type='openapi',
+            status='error',
+            latency_ms=latency_ms,
+            error=str(exc),
+        )
+
+
+@router.get('/tool_servers/status', response_model=ToolServersStatusResponse)
+async def get_tool_servers_status(request: Request, user=Depends(get_admin_user)):
+    """
+    Return the real-time health status of every configured tool server.
+
+    Unlike POST /tool_servers/verify (which probes a single server supplied
+    in the request body), this endpoint probes **all** configured servers
+    concurrently and returns a summary in one call.  Useful for admin
+    dashboards and automated monitoring.
+
+    Each entry reports:
+    - status: 'ok' | 'error' | 'skipped'
+    - latency_ms: round-trip time in milliseconds (null when skipped)
+    - tools_count: number of tools/paths discovered (null on error or skip)
+    - error: human-readable reason when status is not 'ok'
+    """
+    connections = request.app.state.config.TOOL_SERVER_CONNECTIONS or []
+
+    tasks = []
+    for idx, conn in enumerate(connections):
+        server_type = conn.get('type', 'openapi')
+        if server_type == 'mcp':
+            tasks.append(_check_mcp_server(conn, idx))
+        else:
+            tasks.append(_check_openapi_server(conn, idx))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    servers = []
+    for idx, result in enumerate(results):
+        if isinstance(result, Exception):
+            conn = connections[idx]
+            info = conn.get('info') or {}
+            servers.append(
+                ToolServerStatusItem(
+                    id=info.get('id') or str(idx),
+                    name=info.get('name'),
+                    url=conn.get('url', ''),
+                    type=conn.get('type', 'openapi'),
+                    status='error',
+                    error=str(result),
+                )
+            )
+        else:
+            servers.append(result)
+
+    return ToolServersStatusResponse(servers=servers)
 
 
 ############################
