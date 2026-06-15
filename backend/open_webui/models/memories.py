@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Optional
 
 from open_webui.internal.db import Base, get_async_db_context
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, delete, select
+from sqlalchemy import JSON, BigInteger, Boolean, Column, Float, String, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -22,6 +21,12 @@ class Memory(Base):  # user memory store
     content = Column(Text)  # free-form text learned from conversation
     updated_at = Column(BigInteger)  # epoch seconds
     created_at = Column(BigInteger)  # epoch seconds
+    node_type = Column(String, nullable=False, default='fact', server_default='fact')
+    entity_name = Column(String, nullable=True)
+    confidence = Column(Float, nullable=False, default=1.0, server_default='1.0')
+    source_chat_id = Column(String, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True, server_default='1')
+    meta = Column(JSON, nullable=True)
 
 
 class MemoryModel(BaseModel):
@@ -32,6 +37,12 @@ class MemoryModel(BaseModel):
     content: str
     updated_at: int  # timestamp in epoch
     created_at: int  # timestamp in epoch
+    node_type: str = 'fact'
+    entity_name: str | None = None
+    confidence: float = 1.0
+    source_chat_id: str | None = None
+    is_active: bool = True
+    meta: dict | None = None
     model_config = ConfigDict(from_attributes=True)  # allows ORM mapping
 
 
@@ -40,6 +51,11 @@ class MemoriesTable:
         self,
         user_id: str,
         content: str,
+        node_type: str = 'fact',
+        entity_name: str | None = None,
+        confidence: float = 1.0,
+        source_chat_id: str | None = None,
+        meta: dict | None = None,
         db: AsyncSession | None = None,
     ) -> MemoryModel | None:
         """Persist a new memory entry and return the created model."""
@@ -51,11 +67,54 @@ class MemoriesTable:
                 content=content,
                 created_at=now,
                 updated_at=now,
+                node_type=node_type,
+                entity_name=entity_name,
+                confidence=confidence,
+                source_chat_id=source_chat_id,
+                is_active=True,
+                meta=meta,
             )
             db.add(record)
             await db.commit()
             await db.refresh(record)
             return MemoryModel.model_validate(record) if record else None
+
+    async def get_memories_by_user_id_and_type(
+        self,
+        user_id: str,
+        node_type: str,
+        active_only: bool = True,
+        db: AsyncSession | None = None,
+    ) -> list[MemoryModel]:
+        async with get_async_db_context(db) as db:
+            try:
+                query = select(Memory).filter_by(user_id=user_id, node_type=node_type)
+                if active_only:
+                    query = query.where(Memory.is_active.is_(True))
+                result = await db.execute(query)
+                return [MemoryModel.model_validate(memory) for memory in result.scalars().all()]
+            except Exception:
+                return []
+
+    async def deactivate_memory_by_id(
+        self,
+        id: str,
+        user_id: str,
+        db: AsyncSession | None = None,
+    ) -> MemoryModel | None:
+        async with get_async_db_context(db) as db:
+            try:
+                memory = await db.get(Memory, id)
+                if not memory or memory.user_id != user_id:
+                    return None
+
+                memory.is_active = False
+                memory.updated_at = int(time.time())
+                await db.commit()
+                await db.refresh(memory)
+                return MemoryModel.model_validate(memory)
+            except Exception:
+                return None
 
     async def update_memory_by_id_and_user_id(
         self,
